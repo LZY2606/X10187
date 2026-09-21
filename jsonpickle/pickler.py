@@ -172,6 +172,39 @@ def _wrap_string_slot(string: str | Sequence[str]) -> Sequence[str]:
     return string
 
 
+class _PicklerSession:
+    """Mutable state for a single top-level encode operation.
+
+    A long-lived ``Pickler`` only carries read-only configuration
+    (backend, handler registry, flags) between runs.  Everything that is
+    accumulated while walking one object graph -- reference IDs, recursion
+    depth, the memo caches and the GC anchors -- lives on a session object
+    so that a finished or failed run never leaves per-run state behind on
+    the pickler itself.
+
+    The session holds references to the read-only configuration it relies
+    on (the JSON backend and the handler registry) but deliberately does
+    not reference the pickler itself: a session->pickler edge would create
+    a reference cycle and keep ephemeral picklers (and the objects they
+    anchored) alive until the cyclic GC runs.
+    """
+
+    __slots__ = ("backend", "handlers", "depth", "objs", "seen", "flattened")
+
+    def __init__(self, context: "Pickler") -> None:
+        # Read-only configuration: JSON backend and handler registry.
+        self.backend = context.backend
+        self.handlers = handlers
+        # The current recursion depth
+        self.depth = -1
+        # Maps id(obj) to reference IDs
+        self.objs: dict[int, int] = {}
+        # Avoids garbage collection
+        self.seen: list[Any] = []
+        # A cache of objects that have already been flattened.
+        self.flattened: dict[int, Any] = {}
+
+
 class Pickler:
     def __init__(
         self,
@@ -193,16 +226,10 @@ class Pickler:
         self.keys = keys
         self.warn = warn
         self.use_base85 = use_base85
-        # The current recursion depth
-        self._depth = -1
         # The maximal recursion depth
         self._max_depth = max_depth
-        # Maps id(obj) to reference IDs
-        self._objs = {}
-        # Avoids garbage collection
-        self._seen = []
-        # A cache of objects that have already been flattened.
-        self._flattened = {}
+        # Per-run mutable state; see _PicklerSession.
+        self._session = _PicklerSession(self)
         # Used for util._is_readonly, see +483
         self.handle_readonly = handle_readonly
         # Custom context passed through to custom handlers, see #452
@@ -220,6 +247,41 @@ class Pickler:
         self.include_properties = include_properties
 
         self._original_object = original_object
+
+    # Per-run state lives on the current session.  These properties keep
+    # the historical attribute locations working for handlers and tests
+    # that introspect the pickler (e.g. the numpy extension handler).
+    @property
+    def _depth(self) -> int:
+        return self._session.depth
+
+    @_depth.setter
+    def _depth(self, value: int) -> None:
+        self._session.depth = value
+
+    @property
+    def _objs(self) -> dict[int, int]:
+        return self._session.objs
+
+    @_objs.setter
+    def _objs(self, value: dict[int, int]) -> None:
+        self._session.objs = value
+
+    @property
+    def _seen(self) -> list[Any]:
+        return self._session.seen
+
+    @_seen.setter
+    def _seen(self, value: list[Any]) -> None:
+        self._session.seen = value
+
+    @property
+    def _flattened(self) -> dict[int, Any]:
+        return self._session.flattened
+
+    @_flattened.setter
+    def _flattened(self, value: dict[int, Any]) -> None:
+        self._session.flattened = value
 
     def _determine_sort_keys(self) -> bool:
         for _, options in getattr(self.backend, "_encoder_options", {}).values():
@@ -249,10 +311,8 @@ class Pickler:
         return obj
 
     def reset(self) -> None:
-        self._objs = {}
-        self._depth = -1
-        self._seen = []
-        self._flattened = {}
+        """Discard all per-run state by starting a fresh session."""
+        self._session = _PicklerSession(self)
 
     def _push(self) -> None:
         """Steps down one level in the namespace."""
@@ -344,6 +404,17 @@ class Pickler:
         """
         if reset:
             self.reset()
+            try:
+                return self._flatten_entry(obj)
+            finally:
+                # A top-level flatten must not leave per-run state behind,
+                # even when a handler or __getstate__ raises.  Recursive
+                # calls (reset=False) join the current session instead and
+                # are cleaned up by the outermost call.
+                self.reset()
+        return self._flatten_entry(obj)
+
+    def _flatten_entry(self, obj: Any) -> Any:
         if self._determine_sort_keys():
             obj = self._sort_attrs(obj)
         return self._flatten(obj)

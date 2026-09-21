@@ -104,13 +104,15 @@ def decode(
     )
     if handler_context is not None:
         context.handler_context = handler_context
-    data = json.decode(string)
-    result = context.restore(data, reset=reset, classes=classes)
-    if is_ephemeral_context:
-        # Avoid holding onto references to external objects, which can
-        # prevent garbage collection from occuring.
-        context.reset()
-    return result
+    try:
+        data = json.decode(string)
+        return context.restore(data, reset=reset, classes=classes)
+    finally:
+        if is_ephemeral_context:
+            # Avoid holding onto references to external objects, which can
+            # prevent garbage collection from occuring.  This runs even
+            # when the backend fails to parse the input.
+            context.reset()
 
 
 def _safe_hasattr(obj: Any, attr: str) -> bool:
@@ -316,6 +318,55 @@ def _passthrough(value: Any) -> Any:
     return value
 
 
+# (object, attribute, proxy, setter) tuples pending proxy resolution
+_ProxyEntry: TypeAlias = tuple[Any, Any, "_Proxy", Callable[..., None]]
+
+
+class _UnpicklerSession:
+    """Mutable state for a single top-level decode operation.
+
+    A long-lived ``Unpickler`` only carries read-only configuration
+    (backend, class registry, handler registry, flags) between runs.
+    Everything that is accumulated while restoring one document -- the
+    object tables, the path stack and the not-yet-resolved proxies --
+    lives on a session object so that a finished or failed run never
+    leaves per-run state behind on the unpickler itself.
+
+    The session holds references to the read-only configuration it relies
+    on (the JSON backend, the class registry and the handler registry) but
+    deliberately does not reference the unpickler itself: a
+    session->unpickler edge would create a reference cycle and keep
+    ephemeral unpicklers (and the objects they restored) alive until the
+    cyclic GC runs.
+    """
+
+    __slots__ = (
+        "backend",
+        "classes",
+        "handlers",
+        "namedict",
+        "namestack",
+        "obj_to_idx",
+        "objs",
+        "proxies",
+    )
+
+    def __init__(self, context: "Unpickler") -> None:
+        # Read-only configuration: JSON backend, class registry and the
+        # global handler registry.
+        self.backend = context.backend
+        self.classes = context._classes
+        self.handlers = handlers
+        # Map reference names to object instances
+        self.namedict: dict[str, Any] = {}
+        # The stack of names traversed for child objects
+        self.namestack: list[str] = []
+        # Map of objects to their index in the objs list
+        self.obj_to_idx: dict[int, int] = {}
+        self.objs: list[Any] = []
+        self.proxies: list[_ProxyEntry] = []
+
+
 class Unpickler:
     def __init__(
         self,
@@ -335,21 +386,58 @@ class Unpickler:
 
         self.reset()
 
+    # Per-run state lives on the current session.  These properties keep
+    # the historical attribute locations working for handlers and tests
+    # that introspect the unpickler.
+    @property
+    def _namedict(self) -> dict[str, Any]:
+        return self._session.namedict
+
+    @_namedict.setter
+    def _namedict(self, value: dict[str, Any]) -> None:
+        self._session.namedict = value
+
+    @property
+    def _namestack(self) -> list[str]:
+        return self._session.namestack
+
+    @_namestack.setter
+    def _namestack(self, value: list[str]) -> None:
+        self._session.namestack = value
+
+    @property
+    def _obj_to_idx(self) -> dict[int, int]:
+        return self._session.obj_to_idx
+
+    @_obj_to_idx.setter
+    def _obj_to_idx(self, value: dict[int, int]) -> None:
+        self._session.obj_to_idx = value
+
+    @property
+    def _objs(self) -> list[Any]:
+        return self._session.objs
+
+    @_objs.setter
+    def _objs(self, value: list[Any]) -> None:
+        self._session.objs = value
+
+    @property
+    def _proxies(self) -> list[_ProxyEntry]:
+        return self._session.proxies
+
+    @_proxies.setter
+    def _proxies(self, value: list[_ProxyEntry]) -> None:
+        self._session.proxies = value
+
     def reset(self) -> None:
         """Resets the object's internal state."""
-        # Map reference names to object instances
-        self._namedict = {}
-
-        # The stack of names traversed for child objects
-        self._namestack = []
-
-        # Map of objects to their index in the _objs list
-        self._obj_to_idx = {}
-        self._objs = []
-        self._proxies = []
-
         # Extra local classes not accessible globally
         self._classes = {}
+        self._end_session()
+
+    def _end_session(self) -> None:
+        """Discard per-run state without touching registered classes."""
+        self._session = _UnpicklerSession(self)
 
     def _swap_proxies(self) -> None:
         """Replace proxies with their corresponding instances"""
@@ -386,9 +474,18 @@ class Unpickler:
             self.reset()
         if classes:
             self.register_classes(classes)
-        value = self._restore(obj)
-        if reset:
-            self._swap_proxies()
+        try:
+            value = self._restore(obj)
+            if reset:
+                self._swap_proxies()
+        except BaseException:
+            if reset:
+                # A failed top-level restore must not leave per-run state
+                # behind on the (possibly long-lived) unpickler.  This
+                # covers exceptions from handlers, malformed references
+                # and anything else that aborts the run.
+                self._end_session()
+            raise
         return value
 
     def register_classes(self, classes: ClassesType) -> None:
