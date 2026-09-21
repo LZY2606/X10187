@@ -14,7 +14,34 @@ from itertools import chain
 from typing import Any
 
 from . import handlers, tags, util
-from .backend import json
+from .backend import JSONBackend, json
+
+
+class _PicklerSession:
+    """Mutable state for a single top-level flatten run.
+
+    A Pickler holds exactly one active session. Top-level ``flatten()``
+    calls install a fresh session and discard it when the run finishes or
+    fails, so per-run state (the object identity table, recursion depth,
+    anti-gc list and flatten cache) never lingers on long-lived Pickler
+    instances. Read-only configuration such as the active JSON backend is
+    referenced here so that a run's view of the configuration travels
+    together with its mutable state.
+    """
+
+    __slots__ = ("backend", "objs", "depth", "seen", "flattened")
+
+    def __init__(self, backend: JSONBackend) -> None:
+        # Read-only configuration for this run
+        self.backend = backend
+        # Maps id(obj) to reference IDs
+        self.objs: dict[int, int] = {}
+        # The current recursion depth
+        self.depth = -1
+        # Avoids garbage collection
+        self.seen: list[Any] = []
+        # A cache of objects that have already been flattened.
+        self.flattened: dict[int, Any] = {}
 
 
 def encode(
@@ -193,16 +220,10 @@ class Pickler:
         self.keys = keys
         self.warn = warn
         self.use_base85 = use_base85
-        # The current recursion depth
-        self._depth = -1
         # The maximal recursion depth
         self._max_depth = max_depth
-        # Maps id(obj) to reference IDs
-        self._objs = {}
-        # Avoids garbage collection
-        self._seen = []
-        # A cache of objects that have already been flattened.
-        self._flattened = {}
+        # Per-run mutable state lives on the session, not on the pickler
+        self.reset()
         # Used for util._is_readonly, see +483
         self.handle_readonly = handle_readonly
         # Custom context passed through to custom handlers, see #452
@@ -222,7 +243,9 @@ class Pickler:
         self._original_object = original_object
 
     def _determine_sort_keys(self) -> bool:
-        for _, options in getattr(self.backend, "_encoder_options", {}).values():
+        for _, options in getattr(
+            self._session.backend, "_encoder_options", {}
+        ).values():
             if options.get("sort_keys", False):
                 # the user has set one of the backends to sort keys
                 return True
@@ -249,10 +272,44 @@ class Pickler:
         return obj
 
     def reset(self) -> None:
-        self._objs = {}
-        self._depth = -1
-        self._seen = []
-        self._flattened = {}
+        """Discard all per-run state by installing a fresh session."""
+        self._session = _PicklerSession(self.backend)
+
+    @property
+    def _objs(self) -> dict[int, int]:
+        """The active session's id(obj) -> reference ID table."""
+        return self._session.objs
+
+    @_objs.setter
+    def _objs(self, value: dict[int, int]) -> None:
+        self._session.objs = value
+
+    @property
+    def _depth(self) -> int:
+        """The active session's current recursion depth."""
+        return self._session.depth
+
+    @_depth.setter
+    def _depth(self, value: int) -> None:
+        self._session.depth = value
+
+    @property
+    def _seen(self) -> list[Any]:
+        """The active session's anti-garbage-collection list."""
+        return self._session.seen
+
+    @_seen.setter
+    def _seen(self, value: list[Any]) -> None:
+        self._session.seen = value
+
+    @property
+    def _flattened(self) -> dict[int, Any]:
+        """The active session's cache of already-flattened objects."""
+        return self._session.flattened
+
+    @_flattened.setter
+    def _flattened(self, value: dict[int, Any]) -> None:
+        self._session.flattened = value
 
     def _push(self) -> None:
         """Steps down one level in the namespace."""
@@ -343,7 +400,16 @@ class Pickler:
         True
         """
         if reset:
+            # Top-level entry point: run inside a fresh session and make
+            # sure no per-run state survives the call, even when a handler
+            # or the object graph itself raises.
             self.reset()
+            try:
+                if self._determine_sort_keys():
+                    obj = self._sort_attrs(obj)
+                return self._flatten(obj)
+            finally:
+                self.reset()
         if self._determine_sort_keys():
             obj = self._sort_attrs(obj)
         return self._flatten(obj)

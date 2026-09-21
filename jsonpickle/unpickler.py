@@ -10,7 +10,46 @@ from collections.abc import Callable, Iterator, Sequence
 from typing import Any, TypeAlias
 
 from . import errors, handlers, tags, util
-from .backend import json
+from .backend import JSONBackend, json
+
+
+class _UnpicklerSession:
+    """Mutable state for a single top-level restore run.
+
+    An Unpickler holds exactly one active session. Top-level ``restore()``
+    calls install a fresh session and discard it when the run finishes or
+    fails, so per-run state (the object identity tables, the traversal
+    name stack and the not-yet-resolved proxies) never lingers on
+    long-lived Unpickler instances. Read-only configuration such as the
+    active JSON backend is referenced here so that a run's view of the
+    configuration travels together with its mutable state.
+    """
+
+    __slots__ = (
+        "backend",
+        "namedict",
+        "namestack",
+        "obj_to_idx",
+        "objs",
+        "proxies",
+        "classes",
+    )
+
+    def __init__(self, backend: JSONBackend) -> None:
+        # Read-only configuration for this run
+        self.backend = backend
+        # Map reference names to object instances
+        self.namedict: dict[str, Any] = {}
+        # The stack of names traversed for child objects
+        self.namestack: list[str] = []
+        # Map of objects to their index in the objs list
+        self.obj_to_idx: dict[int, int] = {}
+        self.objs: list[Any] = []
+        # Unresolved (obj, attr, proxy, setter) entries awaiting the final
+        # proxy swap at the end of the top-level restore()
+        self.proxies: list[tuple[Any, Any, "_Proxy", Callable[..., None]]] = []
+        # Extra local classes not accessible globally
+        self.classes: dict[str, type] = {}
 
 # class names to class objects (or sequence of classes)
 ClassesType: TypeAlias = type | dict[str, type] | Sequence[type] | None
