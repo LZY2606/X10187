@@ -1,0 +1,87 @@
+name: release
+
+# Only do the release on release and pre-release tags.
+# Examples:
+# * v1.2.3      Stable release
+# * v1.2.3rc4   Preview release candidate
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]rc[0-9]+"
+
+# We need this to be able to create releases.
+permissions:
+  contents: write
+
+jobs:
+  # The create-release job runs purely to initialize the GitHub release itself,
+  # and names the release after the `x.y.z` tag that was pushed. It's separate
+  # from building the release so that we only create the release once.
+  create-release:
+    name: create-release
+    # only run the release flow if a maintainer pushed the tag. these two IDs
+    # are immutable and tied to the GH account, so username changes will still be fine
+    # davvid: 13196
+    # theelx: 43764914
+    if: github.actor_id == '13196' || github.actor_id == '43764914'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Get the release version from the tag
+        if: env.VERSION == ''
+        run: |
+          echo "VERSION=${{ github.ref_name }}" >> $GITHUB_ENV
+          echo "VERSION_NUMBER=$(echo ${{ github.ref_name }} | sed -e s'/^v//')" >> $GITHUB_ENV
+      - name: Show the version
+        run: |
+          echo "VERSION = $VERSION"
+          echo "VERSION_NUMBER = $VERSION_NUMBER"
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$VERSION" --verify-tag --title "$VERSION"
+    outputs:
+      version: ${{ env.VERSION }}
+      version_number: ${{ env.VERSION_NUMBER }}
+
+  build:
+    name: Build distribution
+    if: github.actor_id == '13196' || github.actor_id == '43764914'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install build
+        run: python -m pip install --upgrade build
+      - name: Build sdist and wheel
+        run: python -m build
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish-to-pypi:
+    name: Publish to PyPI
+    if: github.actor_id == '13196' || github.actor_id == '43764914'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/jsonpickle
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        # this tag is v1.14.0, PyPi wants us to pin to their SHA for security in case they get hijacked or something
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b

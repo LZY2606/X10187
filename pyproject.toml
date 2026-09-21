@@ -1,0 +1,123 @@
+[build-system]
+requires = ["setuptools>=61.2", "setuptools_scm[toml]>=6.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jsonpickle"
+license = { text = "BSD-3-Clause" }
+authors = [
+    { name = "Theelx", email = "jsonpickle@all.idois.win" },
+    { name = "David Aguilar", email = "davvid+jsonpickle@gmail.com" },
+]
+description = "jsonpickle encodes/decodes any Python object to/from JSON"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+requires-python = ">=3.10"
+dependencies = [
+]
+dynamic = ["version"]
+
+[project.readme]
+file = "README.rst"
+content-type = "text/x-rst"
+
+[project.urls]
+Documentation = "https://jsonpickle.readthedocs.io/"
+Homepage = "https://jsonpickle.readthedocs.io/"
+Source = "https://github.com/jsonpickle/jsonpickle"
+
+[project.optional-dependencies]
+cov = [
+    "pytest-cov",
+]
+dev = [
+    "pyupgrade",
+]
+testing = [
+    # core
+    "pytest >= 6.0, != 8.1.*",
+    # until the adaptive benchmarking changes are merged,
+    # use dependency groups
+    # "pytest-benchmark",
+    "pytest-benchmark[histogram]",
+    "pytest-checkdocs >= 1.2.3",
+    "pytest-enabler >= 1.0.1",
+    "pytest-ruff >= 0.2.1",
+    # local
+    "bson; python_version < '3.14'",
+    "ecdsa",
+    "feedparser",
+    "gmpy2",
+    "isort",
+    "numpy>=1.21",
+    "pandas",
+    "pymongo",
+    "PyYAML",
+    "scikit-learn",
+    "scipy>=1.9.3; python_version > '3.10'",
+    "scipy; python_version <= '3.10'",
+    "simplejson",
+    "sqlalchemy",
+    "ujson",
+    # fuzzing
+    "atheris ~= 2.3.0; python_version < '3.12'",
+    # type checking
+    "mypy",
+    "pandas-stubs",
+]
+docs = [
+    "furo",
+    "rst.linker >= 1.9",
+    "sphinx >= 3.5",
+]
+packaging = [
+    "build",
+    "setuptools>=61.2",
+    "setuptools_scm[toml]>=6.0",
+    "twine",
+    "pypi-attestations",
+]
+
+[dependency-groups]
+benchmark = [
+    # temporarily pin to adaptive rounds branch until it's merged into main
+    # credit to @akx for implementing this!
+    # install with "pip install jsonpickle[testing] --group benchmark"
+    "pytest-benchmark[histogram] @ git+https://github.com/Theelx/pytest-benchmark.git",
+]
+
+[tool.setuptools]
+packages = [
+    "jsonpickle",
+    "jsonpickle.ext",
+]
+include-package-data = true
+
+[tool.setuptools_scm]
+
+[tool.pytest-enabler.ruff]
+addopts = "--ruff"
+
+[tool.ruff]
+# Make it agree with black
+line-length = 88
+target-version = "py310"
+# For temporary git-ignored local files for testing issues
+extend-exclude = [
+  "*no_lint*.py",
+  "metrics/*",
+]
+
+[tool.ruff.lint]
+# E721 Do not compare types -> jsonpickle compares types using "is" for performance.
+# E402 Module level import not at top of file -> this is expected behavior for isort and black
+ignore = ["E721", "E402"]

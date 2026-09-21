@@ -1,0 +1,85 @@
+/.coverage
+/build
+/dist
+/docs/build
+/images/benchmark-*.svg
+/images/benchmark-data
+/images/benchmark-compare*.png
+/images/benchmark-summary*.png
+/benchmarking/*_old*.py
+/benchmarking/images/
+/metrics/
+/.eggs
+/env*
+/htmlcov
+/tags
+/pages
+/.pytest_cache
+/.tox
+/.idea
+/.vscode
+__pycache__
+*.py[cod]
+*.egg-info
+*.swp
+*#*
+*~
+*.tar.gz
+examples/example.json
+
+# Local benchmarking files for Theelx
+kern*.py
+*.lprof
+benchmark-*.json
+perf.csv
+perf.svg
+# Files created by OSS-Fuzz when running locally
+fuzz_*.pkg.spec
+*.dict
+monkeytype.sqlite3
+# pyenv files
+.python-version
+# type checking config
+.pyre*
+# vscode workspaces
+*.code-workspace
+# benchmarking code
+.bench-venvs/
+.bench-worktrees/
+/benchmarking/.bench-common-tests.json
+# --- 依赖与构建产物（不进交付快照）---
+node_modules/
+bower_components/
+.pnp.*
+dist/
+build/
+out/
+target/
+.next/
+.nuxt/
+.svelte-kit/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+vendor/bundle/
+Pods/
+.gradle/
+.cargo/
+.DS_Store
+.env
+.env.*
+*.log
+coverage/
+.coverage
+.nyc_output/
+.cache/
+.parcel-cache/
+.vite/
+.turbo/
+*.tsbuildinfo
