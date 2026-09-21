@@ -172,6 +172,30 @@ def _wrap_string_slot(string: str | Sequence[str]) -> Sequence[str]:
     return string
 
 
+class _PicklerSession:
+    """Mutable state scoped to a single top-level flatten() run.
+
+    A session is entered by the outermost ``Pickler.flatten`` call and shared
+    by every recursive flatten() issued from handlers, ``__getstate__`` and
+    friends. Long-lived configuration (backend, registries, options) stays on
+    the pickler; nothing in here survives the top-level call.
+    """
+
+    def __init__(self, pickler: "Pickler") -> None:
+        self.pickler = pickler
+        self.reset()
+
+    def reset(self) -> None:
+        # The current recursion depth
+        self.depth = -1
+        # Maps id(obj) to reference IDs
+        self.objs = {}
+        # Avoids garbage collection
+        self.seen = []
+        # A cache of objects that have already been flattened
+        self.flattened = {}
+
+
 class Pickler:
     def __init__(
         self,
@@ -193,16 +217,10 @@ class Pickler:
         self.keys = keys
         self.warn = warn
         self.use_base85 = use_base85
-        # The current recursion depth
-        self._depth = -1
         # The maximal recursion depth
         self._max_depth = max_depth
-        # Maps id(obj) to reference IDs
-        self._objs = {}
-        # Avoids garbage collection
-        self._seen = []
-        # A cache of objects that have already been flattened.
-        self._flattened = {}
+        # Per-top-level-call mutable state; absent when no run is active.
+        self._session: _PicklerSession | None = None
         # Used for util._is_readonly, see +483
         self.handle_readonly = handle_readonly
         # Custom context passed through to custom handlers, see #452
@@ -248,23 +266,80 @@ class Pickler:
                 pass
         return obj
 
+    # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
     def reset(self) -> None:
-        self._objs = {}
-        self._depth = -1
-        self._seen = []
-        self._flattened = {}
+        """Discard the mutable state of the current run, if any."""
+        self._session = _PicklerSession(self)
+
+    def _ensure_session(self) -> _PicklerSession:
+        session = self._session
+        if session is None:
+            session = _PicklerSession(self)
+            self._session = session
+        return session
+
+    @property
+    def _depth(self) -> int:
+        """Current recursion depth (session-owned; -1 when no run is active)."""
+        session = self._session
+        return session.depth if session is not None else -1
+
+    @property
+    def _objs(self) -> dict[int, int]:
+        """id(obj) -> ref id table for the active run (session-owned)."""
+        session = self._session
+        if session is None:
+            return {}
+        return session.objs
+
+    @_objs.setter
+    def _objs(self, value: dict[int, int]) -> None:
+        session = self._session
+        if session is None:
+            self.reset()
+            session = self._session
+        assert session is not None
+        session.objs = value
+
+    @property
+    def _seen(self) -> list[Any]:
+        """Objects referenced by the active run (session-owned)."""
+        session = self._session
+        return session.seen if session is not None else []
+
+    @property
+    def _flattened(self) -> dict[int, Any]:
+        """Already-flattened objects of the active run (session-owned)."""
+        session = self._session
+        if session is None:
+            return {}
+        return session.flattened
+
+    @_flattened.setter
+    def _flattened(self, value: dict[int, Any]) -> None:
+        session = self._session
+        if session is None:
+            self.reset()
+            session = self._session
+        assert session is not None
+        session.flattened = value
 
     def _push(self) -> None:
         """Steps down one level in the namespace."""
-        self._depth += 1
+        assert self._session is not None
+        self._session.depth += 1
 
     def _pop(self, value: Any) -> Any:
         """Step up one level in the namespace and return the value.
-        If we're at the root, reset the pickler's state.
+        If we're at the root, reset the session's state.
         """
-        self._depth -= 1
-        if self._depth == -1:
-            self.reset()
+        assert self._session is not None
+        session = self._session
+        session.depth -= 1
+        if session.depth == -1:
+            session.reset()
         return value
 
     def _log_ref(self, obj: Any) -> bool:
@@ -273,11 +348,12 @@ class Pickler:
         Return True if this object is new and was assigned
         a new ID. Otherwise return False.
         """
+        objs = self._session.objs
         objid = id(obj)
-        is_new = objid not in self._objs
+        is_new = objid not in objs
         if is_new:
-            new_id = len(self._objs)
-            self._objs[objid] = new_id
+            new_id = len(objs)
+            objs[objid] = new_id
         return is_new
 
     def _mkref(self, obj: Any) -> bool:
@@ -297,21 +373,22 @@ class Pickler:
         test_decimal_passthrough_repeated_instance. Only safe to call for
         an object that was just logged, which basically limits it to handlers.
         """
-        self._objs.pop(id(obj), None)
+        self._session.objs.pop(id(obj), None)
 
     def _getref(self, obj: Any) -> dict[str, int]:
         """Return a "py/id" entry for the specified object"""
-        return {tags.ID: self._objs.get(id(obj))}  # type: ignore[dict-item]
+        return {tags.ID: self._session.objs.get(id(obj))}  # type: ignore[dict-item]
 
     def _flatten(self, obj: Any) -> Any:
         """Flatten an object and its guts into a json-safe representation"""
+        flattened = self._session.flattened
         if self.unpicklable and self.make_refs:
             result = self._flatten_impl(obj)
         else:
             try:
-                result = self._flattened[id(obj)]
+                result = flattened[id(obj)]
             except KeyError:
-                result = self._flattened[id(obj)] = self._flatten_impl(obj)
+                result = flattened[id(obj)] = self._flatten_impl(obj)
         return result
 
     def flatten(self, obj: Any, reset: bool = True) -> Any:
@@ -342,11 +419,24 @@ class Pickler:
         >>> p.flatten({'key': 'value'}) == {'key': 'value'}
         True
         """
+        # reset=True is a run boundary: it starts (and closes) a session.
+        # reset=False joins whatever session is currently active; if none
+        # exists yet (incremental use) one is created and left open, exactly
+        # like a handler re-entering flatten() during an outer run.
+        starts_session = reset or self._session is None
         if reset:
             self.reset()
-        if self._determine_sort_keys():
-            obj = self._sort_attrs(obj)
-        return self._flatten(obj)
+        else:
+            self._ensure_session()
+        try:
+            if self._determine_sort_keys():
+                obj = self._sort_attrs(obj)
+            return self._flatten(obj)
+        finally:
+            if reset:
+                # Release every per-run reference so that reused codecs do
+                # not retain the object graph of a previous invocation.
+                self._session = None
 
     def _flatten_bytestring(self, obj: bytes) -> dict[str, str]:
         return {self._bytes_tag: self._bytes_encoder(obj)}
@@ -371,19 +461,19 @@ class Pickler:
         return self._pop(self._flatten_obj(obj))
 
     def _max_reached(self) -> bool:
-        return self._depth == self._max_depth
+        return self._session.depth == self._max_depth
 
     def _pickle_warning(self, obj: Any) -> None:
         if self.warn:
             warnings.warn(f"jsonpickle cannot pickle {obj}: replaced with None")
 
     def _flatten_obj(self, obj: Any) -> Any:
-        self._seen.append(obj)
+        self._session.seen.append(obj)
 
         max_reached = self._max_reached()
 
         try:
-            in_cycle = _in_cycle(obj, self._objs, max_reached, self.make_refs)
+            in_cycle = _in_cycle(obj, self._session.objs, max_reached, self.make_refs)
             flatten_func: Callable[[Any], str] | None
             if in_cycle:
                 # break the cycle
@@ -759,7 +849,7 @@ class Pickler:
             return self._getref(obj)
         else:
             max_reached = self._max_reached()
-            in_cycle = _in_cycle(obj, self._objs, max_reached, False)
+            in_cycle = _in_cycle(obj, self._session.objs, max_reached, False)
             if in_cycle:
                 # A circular becomes None.
                 return None

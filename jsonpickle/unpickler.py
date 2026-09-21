@@ -104,13 +104,16 @@ def decode(
     )
     if handler_context is not None:
         context.handler_context = handler_context
-    data = json.decode(string)
-    result = context.restore(data, reset=reset, classes=classes)
-    if is_ephemeral_context:
-        # Avoid holding onto references to external objects, which can
-        # prevent garbage collection from occuring.
-        context.reset()
-    return result
+    try:
+        data = json.decode(string)
+        result = context.restore(data, reset=reset, classes=classes)
+        return result
+    finally:
+        if is_ephemeral_context:
+            # Avoid holding onto references to external objects, which can
+            # prevent garbage collection from occuring. Runs even when the
+            # backend fails to parse the input or restore() raises.
+            context.reset()
 
 
 def _safe_hasattr(obj: Any, attr: str) -> bool:
@@ -316,6 +319,38 @@ def _passthrough(value: Any) -> Any:
     return value
 
 
+class _UnpicklerSession:
+    """Mutable state scoped to a single top-level restore() run.
+
+    A session is entered by the outermost ``Unpickler.restore`` call and shared
+    by every recursive restore() issued from handlers, encoded-key decoding
+    and friends. Long-lived configuration (backend, class/handler registries,
+    options) stays on the unpickler; nothing in here survives the top-level
+    call.
+    """
+
+    def __init__(self, unpickler: "Unpickler") -> None:
+        self.unpickler = unpickler
+        self.reset()
+
+    def reset(self) -> None:
+        # Map reference names to object instances
+        self.namedict = {}
+
+        # The stack of names traversed for child objects
+        self.namestack = []
+
+        # Map of objects to their index in the objs list
+        self.obj_to_idx = {}
+        self.objs = []
+
+        # Pending (obj, attr, proxy, method) entries awaiting the final sweep
+        self.proxies = []
+
+        # Extra local classes registered for this run
+        self.classes = {}
+
+
 class Unpickler:
     def __init__(
         self,
@@ -333,29 +368,74 @@ class Unpickler:
         # Custom context passed through to custom handlers, see #452
         self.handler_context = handler_context
 
-        self.reset()
+        # Per-top-level-call mutable state; absent when no run is active.
+        self._session: _UnpicklerSession | None = None
 
+    # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
     def reset(self) -> None:
         """Resets the object's internal state."""
-        # Map reference names to object instances
-        self._namedict = {}
+        self._session = _UnpicklerSession(self)
 
-        # The stack of names traversed for child objects
-        self._namestack = []
+    def _ensure_session(self) -> _UnpicklerSession:
+        session = self._session
+        if session is None:
+            session = _UnpicklerSession(self)
+            self._session = session
+        return session
 
-        # Map of objects to their index in the _objs list
-        self._obj_to_idx = {}
-        self._objs = []
-        self._proxies = []
+    @property
+    def _namedict(self) -> dict[str, Any]:
+        """Reference-name table for the active run (session-owned)."""
+        session = self._session
+        return session.namedict if session is not None else {}
 
-        # Extra local classes not accessible globally
-        self._classes = {}
+    @property
+    def _namestack(self) -> list[str]:
+        """Current name stack (session-owned; [] when no run is active)."""
+        session = self._session
+        return session.namestack if session is not None else []
+
+    @_namestack.setter
+    def _namestack(self, value: list[str]) -> None:
+        self._ensure_session().namestack = value
+
+    @property
+    def _obj_to_idx(self) -> dict[int, int]:
+        """id(obj) -> objs index table for the active run (session-owned)."""
+        session = self._session
+        return session.obj_to_idx if session is not None else {}
+
+    @property
+    def _objs(self) -> list[Any]:
+        """Restored objects of the active run (session-owned)."""
+        session = self._session
+        return session.objs if session is not None else []
+
+    @property
+    def _proxies(self) -> list[tuple[Any, Any, _Proxy, Any]]:
+        """Pending proxy swaps of the active run (session-owned)."""
+        session = self._session
+        return session.proxies if session is not None else []
+
+    @_proxies.setter
+    def _proxies(self, value: list[tuple[Any, Any, _Proxy, Any]]) -> None:
+        self._ensure_session().proxies = value
+
+    @property
+    def _classes(self) -> dict[str, type]:
+        """Per-run local class registry (session-owned)."""
+        session = self._session
+        return session.classes if session is not None else {}
 
     def _swap_proxies(self) -> None:
         """Replace proxies with their corresponding instances"""
-        for obj, attr, proxy, method in self._proxies:
+        session = self._session
+        assert session is not None
+        for obj, attr, proxy, method in session.proxies:
             method(obj, attr, proxy)
-        self._proxies = []
+        session.proxies = []
 
     def _restore(
         self, obj: Any, _passthrough: Callable[[Any], Any] = _passthrough
@@ -382,14 +462,26 @@ class Unpickler:
         True
 
         """
+        # reset=True is a run boundary: it starts (and closes) a session,
+        # including the final proxy sweep. reset=False joins whatever session
+        # is currently active; if none exists yet (incremental/object_hook
+        # use) one is created and left open for the next incremental call.
         if reset:
             self.reset()
-        if classes:
-            self.register_classes(classes)
-        value = self._restore(obj)
-        if reset:
-            self._swap_proxies()
-        return value
+        else:
+            self._ensure_session()
+        try:
+            if classes:
+                self.register_classes(classes)
+            value = self._restore(obj)
+            if reset:
+                self._swap_proxies()
+            return value
+        finally:
+            if reset:
+                # Release every per-run reference (including unresolved
+                # proxies) so that reused codecs start the next run clean.
+                self._session = None
 
     def register_classes(self, classes: ClassesType) -> None:
         """Register one or more classes
@@ -397,11 +489,12 @@ class Unpickler:
         :param classes: sequence of classes or a single class to register
 
         """
+        local_classes = self._ensure_session().classes
         if isinstance(classes, (list, tuple, set)):
             for cls in classes:
                 self.register_classes(cls)
         elif isinstance(classes, dict):
-            self._classes.update(
+            local_classes.update(
                 (
                     cls if isinstance(cls, str) else util.importable_name(cls),
                     handler,
@@ -409,7 +502,7 @@ class Unpickler:
                 for cls, handler in classes.items()
             )
         else:
-            self._classes[util.importable_name(classes)] = classes  # type: ignore[arg-type]
+            local_classes[util.importable_name(classes)] = classes  # type: ignore[arg-type]
 
     def _restore_base64(self, obj: dict[str, Any]) -> bytes:
         try:
@@ -455,18 +548,19 @@ class Unpickler:
         True
 
         """
-        return "/" + "/".join(self._namestack)
+        return "/" + "/".join(self._session.namestack)
 
     def _mkref(self, obj: Any) -> Any:
+        session = self._session
         obj_id = id(obj)
         try:
-            _ = self._obj_to_idx[obj_id]
+            _ = session.obj_to_idx[obj_id]
         except KeyError:
-            self._obj_to_idx[obj_id] = len(self._objs)
-            self._objs.append(obj)
+            session.obj_to_idx[obj_id] = len(session.objs)
+            session.objs.append(obj)
             # Backwards compatibility: old versions of jsonpickle
             # produced "py/ref" references.
-            self._namedict[self._refname()] = obj
+            session.namedict[self._refname()] = obj
         return obj
 
     def _restore_list(self, obj: list[Any]) -> list[Any]:
@@ -480,7 +574,7 @@ class Unpickler:
             for idx, value in enumerate(parent)
             if isinstance(value, _Proxy)
         ]
-        self._proxies.extend(proxies)
+        self._session.proxies.extend(proxies)
         return parent
 
     def _restore_iterator(self, obj: dict[str, Any]) -> Iterator[Any]:
@@ -490,15 +584,16 @@ class Unpickler:
             return iter([])
 
     def _swapref(self, proxy: _Proxy, instance: Any) -> None:
+        session = self._session
         proxy_id = id(proxy)
         instance_id = id(instance)
 
-        instance_index = self._obj_to_idx[proxy_id]
-        self._obj_to_idx[instance_id] = instance_index
-        del self._obj_to_idx[proxy_id]
+        instance_index = session.obj_to_idx[proxy_id]
+        session.obj_to_idx[instance_id] = instance_index
+        del session.obj_to_idx[proxy_id]
 
-        self._objs[instance_index] = instance
-        self._namedict[self._refname()] = instance
+        session.objs[instance_index] = instance
+        session.namedict[self._refname()] = instance
 
     def _restore_reduce(self, obj: dict[str, Any]) -> Any:
         """
@@ -585,14 +680,14 @@ class Unpickler:
     def _restore_id(self, obj: dict[str, Any]) -> Any:
         try:
             idx = obj[tags.ID]
-            return self._objs[idx]
+            return self._session.objs[idx]
         except IndexError:
-            return _IDProxy(self._objs, idx)
+            return _IDProxy(self._session.objs, idx)
         except TypeError:
             return None
 
     def _restore_type(self, obj: dict[str, Any]) -> Any:
-        typeref = util.loadclass(obj[tags.TYPE], classes=self._classes)
+        typeref = util.loadclass(obj[tags.TYPE], classes=self._session.classes)
         if typeref is None:
             return obj
         return typeref
@@ -684,7 +779,7 @@ class Unpickler:
                 str_k = k.__str__()
             else:
                 str_k = k
-            self._namestack.append(str_k)
+            self._session.namestack.append(str_k)
             if restore_dict_items:
                 k = restore_key(k)
                 # step into the namespace
@@ -701,7 +796,7 @@ class Unpickler:
                     # Immutable object, must be constructed in one shot
                     if k != "__dict__":
                         deferred[k] = value
-                    self._namestack.pop()
+                    self._session.namestack.pop()
                     continue
             else:
                 if not k.startswith("__"):
@@ -733,10 +828,10 @@ class Unpickler:
             # This instance has an instance variable named `k` that is
             # currently a proxy and must be replaced
             if isinstance(value, _Proxy):
-                self._proxies.append((instance, k, value, method))
+                self._session.proxies.append((instance, k, value, method))
 
             # step out
-            self._namestack.pop()
+            self._session.namestack.pop()
 
         if deferred:
             # SQLAlchemy Immutable mappings must be constructed in one shot
@@ -811,7 +906,7 @@ class Unpickler:
         if has_tag(obj, tags.NEWARGSEX):
             args, kwargs = obj[tags.NEWARGSEX]
         else:
-            args = getargs(obj, classes=self._classes)
+            args = getargs(obj, classes=self._session.classes)
             kwargs = {}
         if args:
             args = self._restore(args)
@@ -859,7 +954,7 @@ class Unpickler:
 
     def _restore_object(self, obj: dict[str, Any]) -> Any:
         class_name = obj[tags.OBJECT]
-        cls = util.loadclass(class_name, classes=self._classes)
+        cls = util.loadclass(class_name, classes=self._session.classes)
         handler = handlers.get(cls, handlers.get(class_name))  # type: ignore[arg-type]
         if handler is not None:  # custom handler
             proxy = _Proxy()
@@ -877,7 +972,7 @@ class Unpickler:
         return self._restore_object_instance(obj, cls, class_name)
 
     def _restore_function(self, obj: dict[str, Any]) -> Any:
-        return util.loadclass(obj[tags.FUNCTION], classes=self._classes)
+        return util.loadclass(obj[tags.FUNCTION], classes=self._session.classes)
 
     def _restore_set(self, obj: dict[str, Any]) -> set[Any]:
         try:
@@ -902,18 +997,18 @@ class Unpickler:
                     str_k = k.__str__()
                 else:
                     str_k = k
-                self._namestack.append(str_k)
+                self._session.namestack.append(str_k)
                 data[k] = result = self._restore(v)
                 if isinstance(result, _Proxy):
-                    self._proxies.append((data, k, result, _obj_setvalue))
+                    self._session.proxies.append((data, k, result, _obj_setvalue))
 
-                self._namestack.pop()
+                self._session.namestack.pop()
 
             # Phase 2: object keys only.
             for k, v in util.items(obj):
                 if not _is_json_key(k):
                     continue
-                self._namestack.append(k)
+                self._session.namestack.append(k)
 
                 restored_key = self._restore_pickled_key(k)
                 result = self._restore(v)
@@ -928,9 +1023,9 @@ class Unpickler:
                     k = restored_key
                 # k is currently a proxy and must be replaced
                 if isinstance(result, _Proxy):
-                    self._proxies.append((data, k, result, _obj_setvalue))
+                    self._session.proxies.append((data, k, result, _obj_setvalue))
 
-                self._namestack.pop()
+                self._session.namestack.pop()
         else:
             # No special keys, thus we don't need to restore the keys either.
             for k, v in util.items(obj):
@@ -938,11 +1033,11 @@ class Unpickler:
                     str_k = k.__str__()
                 else:
                     str_k = k
-                self._namestack.append(str_k)
+                self._session.namestack.append(str_k)
                 data[k] = result = self._restore(v)
                 if isinstance(result, _Proxy):
-                    self._proxies.append((data, k, result, _obj_setvalue))
-                self._namestack.pop()
+                    self._session.proxies.append((data, k, result, _obj_setvalue))
+                self._session.namestack.pop()
         return data
 
     def _restore_tuple(self, obj: dict[str, Any]) -> tuple[Any, ...]:

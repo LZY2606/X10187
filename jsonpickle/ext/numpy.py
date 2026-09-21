@@ -306,11 +306,12 @@ class NumpyNDArrayHandlerView(NumpyNDArrayHandlerBinary):
         far as py/id allocation is concerned.
         """
         context = self.context
-        saved_objs = dict(context._objs)
-        saved_flattened = dict(context._flattened)
+        session = context._session
+        saved_objs = dict(session.objs)
+        saved_flattened = dict(session.flattened)
         super(NumpyNDArrayHandlerBinary, self).flatten(obj, data)
-        context._objs = saved_objs
-        context._flattened = saved_flattened
+        session.objs = saved_objs
+        session.flattened = saved_flattened
 
     def flatten(self, obj: npt.NDArray[Any], data: dict[str, Any]) -> dict[str, Any]:
         """encode numpy to json"""
