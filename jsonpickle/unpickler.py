@@ -316,6 +316,45 @@ def _passthrough(value: Any) -> Any:
     return value
 
 
+class _UnpicklerSession:
+    """Mutable state for a single top-level restore() run.
+
+    The Unpickler itself only carries read-only configuration (backend,
+    class registry, handler registry, options); everything that changes
+    while a document is being restored lives here.  A failed run
+    discards its session so that no partial state lingers on a
+    long-lived unpickler; a completed run keeps its object tables
+    available for incremental restore(reset=False) calls until they
+    are released by an explicit reset() or the next reset=True call.
+    """
+
+    __slots__ = (
+        "backend",
+        "classes",
+        "handlers",
+        "namedict",
+        "namestack",
+        "obj_to_idx",
+        "objs",
+        "proxies",
+    )
+
+    def __init__(self, context: "Unpickler") -> None:
+        # Read-only configuration shared with the owning unpickler.
+        self.backend = context.backend
+        self.classes = context._classes
+        self.handlers = handlers.registry
+        # Map reference names to object instances
+        self.namedict: dict[str, Any] = {}
+        # The stack of names traversed for child objects
+        self.namestack: list[str] = []
+        # Map of objects to their index in the objs list
+        self.obj_to_idx: dict[int, int] = {}
+        self.objs: list[Any] = []
+        # Objects that reference not-yet-constructed instances
+        self.proxies: list[tuple[Any, Any, _Proxy, Callable[..., None]]] = []
+
+
 class Unpickler:
     def __init__(
         self,
@@ -337,19 +376,50 @@ class Unpickler:
 
     def reset(self) -> None:
         """Resets the object's internal state."""
-        # Map reference names to object instances
-        self._namedict = {}
-
-        # The stack of names traversed for child objects
-        self._namestack = []
-
-        # Map of objects to their index in the _objs list
-        self._obj_to_idx = {}
-        self._objs = []
-        self._proxies = []
-
         # Extra local classes not accessible globally
         self._classes = {}
+        # Per-run mutable state; see _UnpicklerSession
+        self._session = _UnpicklerSession(self)
+
+    @property
+    def _namedict(self) -> dict[str, Any]:
+        return self._session.namedict
+
+    @_namedict.setter
+    def _namedict(self, value: dict[str, Any]) -> None:
+        self._session.namedict = value
+
+    @property
+    def _namestack(self) -> list[str]:
+        return self._session.namestack
+
+    @_namestack.setter
+    def _namestack(self, value: list[str]) -> None:
+        self._session.namestack = value
+
+    @property
+    def _obj_to_idx(self) -> dict[int, int]:
+        return self._session.obj_to_idx
+
+    @_obj_to_idx.setter
+    def _obj_to_idx(self, value: dict[int, int]) -> None:
+        self._session.obj_to_idx = value
+
+    @property
+    def _objs(self) -> list[Any]:
+        return self._session.objs
+
+    @_objs.setter
+    def _objs(self, value: list[Any]) -> None:
+        self._session.objs = value
+
+    @property
+    def _proxies(self) -> list[tuple[Any, Any, _Proxy, Callable[..., None]]]:
+        return self._session.proxies
+
+    @_proxies.setter
+    def _proxies(self, value: list[tuple[Any, Any, _Proxy, Callable[..., None]]]) -> None:
+        self._session.proxies = value
 
     def _swap_proxies(self) -> None:
         """Replace proxies with their corresponding instances"""
@@ -386,9 +456,28 @@ class Unpickler:
             self.reset()
         if classes:
             self.register_classes(classes)
-        value = self._restore(obj)
-        if reset:
+        if not reset:
+            # Join the current session instead of starting a new one.
+            # This covers both recursive calls from custom handlers and
+            # deliberate incremental restores; the accumulated state is
+            # released by an explicit reset() or the next reset=True call.
+            return self._restore(obj)
+        session = self._session
+        completed = False
+        try:
+            value = self._restore(obj)
             self._swap_proxies()
+            completed = True
+        finally:
+            # A failed run discards its session so that no partial
+            # state lingers on the (possibly long-lived) unpickler.
+            if not completed and self._session is session:
+                self._session = _UnpicklerSession(self)
+        # A successful run is properly finalized: proxies are swapped in
+        # and the name stack is unwound.  The object tables are kept so
+        # that incremental restore(reset=False) calls can keep resolving
+        # references against them; they are released by an explicit
+        # reset() or by the next reset=True call.
         return value
 
     def register_classes(self, classes: ClassesType) -> None:
